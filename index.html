@@ -29,7 +29,7 @@
     <div class="keys">
       <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> or arrows to walk &nbsp;·&nbsp; mouse to look<br>
       hold <kbd>Shift</kbd> to walk faster &nbsp;·&nbsp; <kbd>Esc</kbd> to pause<br>
-      <span style="opacity:.6">On a Quest: press “Enter VR” at the bottom</span>
+      <span style="opacity:.6">On a Quest: press “Enter VR” at the bottom.<br>In VR: A/X lowers your view, B/Y raises it, click a stick to reset.</span>
     </div>
     <div class="go">Click to enter</div>
   </div>
@@ -67,7 +67,7 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMapping = THREE.NeutralToneMapping; // keeps painting colours true, rolls off highlights gently
 renderer.toneMappingExposure = 1.15;
 renderer.xr.enabled = true;
 renderer.xr.setFoveation(0.5);
@@ -77,14 +77,17 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x1a1a1a);
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-scene.environmentIntensity = 0.55;
-scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8070, 1.1));
-const sun = new THREE.DirectionalLight(0xfff4e6, 0.9);
+scene.environmentIntensity = 0.5;
+scene.add(new THREE.HemisphereLight(0xfffaf2, 0x6f685e, 1.5)); // soft ceiling bounce, warm floor bounce
+const sun = new THREE.DirectionalLight(0xfff1e0, 0.75);
 sun.position.set(2, 6, 3);
 scene.add(sun);
 
 // The rig is what moves through the space; the camera rides inside it.
 const rig = new THREE.Group();
+// floorY = height of the gallery floor under you; heightAdj = headset-only offset so your eyes sit at a natural height
+let floorY = 0, heightAdj = 0;
+const setRigY = () => { rig.position.y = floorY + (renderer.xr.isPresenting ? heightAdj : 0); };
 scene.add(rig);
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 200);
 camera.position.y = EYE;
@@ -134,10 +137,8 @@ new GLTFLoader().parse(glbBuf.buffer, '', (gltf) => {
     const mat = o.material;
     if (mat && mat.map && !TEX[mat.name].repeat) {
       // artwork: let it glow slightly as if lit
-      mat.emissive = new THREE.Color(0xffffff);
-      mat.emissiveMap = mat.map;
-      mat.emissiveIntensity = 0.28;
-      mat.roughness = 0.85; mat.metalness = 0;
+      mat.emissiveIntensity = 0; // no self-glow: lit only by the room light
+      mat.roughness = 1; mat.metalness = 0; mat.envMapIntensity = 0.5; // matte, no glare
       const title = prettyTitle(mat.name);
       if (title) artworks.push({ mesh: o, title });
     }
@@ -159,7 +160,7 @@ const bounds = new THREE.Box3();
 function placeAtStart() {
   rig.position.set(START.x, 0, START.z);
   yaw = START.yaw; pitch = 0;
-  rig.position.y = floorAt(rig.position) ?? 0;
+  floorY = floorAt(new THREE.Vector3(rig.position.x, 0, rig.position.z)) ?? 0; setRigY();
   applyLook();
 }
 
@@ -184,22 +185,22 @@ function tryMove(delta) {
     const l = _d.length();
     if (l < 1e-6) continue;
     if (!blocked(_d.clone().normalize(), l)) {
-      const next = rig.position.clone().add(_d);
+      const next = rig.position.clone().add(_d); next.y = floorY;
       // in VR, check where the head will be (you may be standing off-centre in your play space)
       const probe = renderer.xr.isPresenting
         ? next.clone().add(new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld).sub(rig.position).setY(0))
         : next;
       if (!inside(probe)) continue;
       const fy = floorAt(next);
-      if (fy === null || fy - rig.position.y > 0.35) continue; // no floor / too high a step
-      rig.position.copy(next); rig.position.y = fy;
+      if (fy === null || fy - floorY > 0.35) continue; // no floor / too high a step
+      rig.position.x = next.x; rig.position.z = next.z; floorY = fy; setRigY();
       return;
     }
   }
 }
 function blocked(dir, dist) {
   for (const h of [0.35, 1.0, 1.5]) {
-    ray.set(new THREE.Vector3(rig.position.x, rig.position.y + h, rig.position.z), dir);
+    ray.set(new THREE.Vector3(rig.position.x, floorY + h, rig.position.z), dir);
     ray.far = dist + RADIUS;
     if (ray.intersectObjects(solids, false).length) return true;
   }
@@ -286,7 +287,7 @@ function updateAim() {
   beamGeo.setFromPoints([_o.clone(), end.clone()]);
   if (hit && hit.face) {
     const n = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
-    if (Math.abs(n.y) > 0.75 && hit.point.y < rig.position.y + 0.4 && inside(hit.point)) {
+    if (Math.abs(n.y) > 0.75 && hit.point.y < floorY + 0.4 && inside(hit.point)) {
       teleportTarget = hit.point.clone();
       marker.position.copy(hit.point).y += 0.01; marker.visible = true;
     }
@@ -298,16 +299,27 @@ function doTeleport() {
   const head = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
   rig.position.x += teleportTarget.x - head.x;
   rig.position.z += teleportTarget.z - head.z;
-  rig.position.y = teleportTarget.y;
+  floorY = teleportTarget.y; setRigY();
   teleportTarget = null; marker.visible = false;
 }
 let snapReady = true;
+// Headset height: shortly after entering VR, measure how high your eyes are and, if you're
+// standing taller than a typical eye level, lower the view so you clear the door frames.
+const VR_EYE = 1.55;
+let calibrateAt = 0;
+function calibrateHeight() {
+  const h = camera.position.y; // eye height above your real floor
+  if (h > 0.5) heightAdj = Math.min(0, VR_EYE - h);
+  setRigY();
+}
 renderer.xr.addEventListener('sessionstart', () => {
+  calibrateAt = performance.now() + 1500;
   overlay.style.display = 'none';
   camera.position.set(0, 0, 0); camera.rotation.set(0, 0, 0);
   rig.rotation.set(0, yaw, 0);
 });
 renderer.xr.addEventListener('sessionend', () => {
+  setRigY();
   camera.position.set(0, EYE, 0); applyLook();
 });
 
@@ -331,9 +343,16 @@ renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05);
   move.set(0, 0, 0);
   if (renderer.xr.isPresenting) {
+    if (calibrateAt && performance.now() > calibrateAt) { calibrateAt = 0; calibrateHeight(); }
     for (const c of controllers) {
       const src = c.userData.source;
       if (!src || !src.gamepad) continue;
+      const btn = src.gamepad.buttons, prev = c.userData.prev || (c.userData.prev = []);
+      const pressed = (i) => btn[i] && btn[i].pressed && !prev[i];
+      if (pressed(4)) { heightAdj -= 0.05; setRigY(); }       // A / X: lower view 5 cm
+      if (pressed(5)) { heightAdj += 0.05; setRigY(); }       // B / Y: raise view 5 cm
+      if (pressed(3)) calibrateHeight();                       // click a stick: reset height
+      for (let i = 0; i < btn.length; i++) prev[i] = btn[i] && btn[i].pressed;
       const ax = src.gamepad.axes; const x = ax[2] || 0, y = ax[3] || 0;
       if (src.handedness === 'left') {
         if (Math.hypot(x, y) > 0.15) {
@@ -375,7 +394,7 @@ addEventListener('resize', () => {
 
 // debug hook for testing views: window.__view(x,z,yaw,pitch,y)
 window.__view = (x, z, yw, p = 0, y) => {
-  rig.position.set(x, 0, z); rig.position.y = y ?? (floorAt(rig.position) ?? 0);
+  rig.position.set(x, 0, z); floorY = y ?? (floorAt(rig.position) ?? 0); setRigY();
   yaw = yw; pitch = p; applyLook();
 };
 window.__three = { THREE, scene, camera, rig, renderer, solids, artworks, tryMove };
